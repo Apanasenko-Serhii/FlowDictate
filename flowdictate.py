@@ -526,18 +526,91 @@ class Engine:
         return text
 
 
+def find_logo():
+    """Locate the branded icon (bundled in frozen mode, else in assets/)."""
+    names = ["icon.png"]
+    roots = []
+    if getattr(sys, "frozen", False):
+        roots.append(Path(sys._MEIPASS) / "assets")
+        roots.append(Path(sys.executable).parent / "assets")
+    roots.append(Path(__file__).parent / "assets")
+    for r in roots:
+        for n in names:
+            p = r / n
+            if p.exists():
+                return p
+    return None
+
+
+def set_window_icon(root):
+    try:
+        import tkinter as tk
+        p = find_logo()
+        if p:
+            root._icon_img = tk.PhotoImage(file=str(p))
+            root.iconphoto(True, root._icon_img)
+    except Exception:
+        pass
+
+
+def _startup_lnk() -> Path:
+    import os
+    return (Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows"
+            / "Start Menu" / "Programs" / "Startup" / f"{APP_NAME}.lnk")
+
+
+def is_autostart_enabled() -> bool:
+    try:
+        return _startup_lnk().exists()
+    except Exception:
+        return False
+
+
+def set_autostart(enable: bool) -> None:
+    """Create/remove a Startup shortcut so the app launches with Windows."""
+    import subprocess
+    lnk = _startup_lnk()
+    try:
+        if enable:
+            target = sys.executable
+            work = str(Path(target).parent)
+            ps = (
+                "$s = New-Object -ComObject WScript.Shell; "
+                f"$l = $s.CreateShortcut('{lnk}'); "
+                f"$l.TargetPath = '{target}'; "
+                f"$l.WorkingDirectory = '{work}'; $l.Save()"
+            )
+            subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                           creationflags=0x08000000, timeout=15)
+            log.info("Autostart enabled")
+        elif lnk.exists():
+            lnk.unlink()
+            log.info("Autostart disabled")
+    except Exception as e:
+        log.error("Autostart change failed: %s", e)
+
+
 class TrayIcon:
     COLORS = {
         "loading": (128, 128, 128),
         "ready": (46, 160, 67),
         "recording": (220, 53, 53),
         "busy": (240, 180, 0),
-        "error": (0, 0, 0),
+        "error": (200, 60, 40),
     }
 
     def __init__(self, on_quit, on_settings, on_history=None):
         import pystray
         self._pystray = pystray
+        self._base = None
+        p = find_logo()
+        if p:
+            try:
+                from PIL import Image
+                self._base = Image.open(p).convert("RGBA").resize(
+                    (64, 64), Image.LANCZOS)
+            except Exception:
+                self._base = None
         items = [pystray.MenuItem("Налаштування…", lambda: on_settings())]
         if on_history is not None:
             items.append(pystray.MenuItem("Історія…", lambda: on_history()))
@@ -549,9 +622,19 @@ class TrayIcon:
 
     def _image(self, state: str):
         from PIL import Image, ImageDraw
+        color = self.COLORS.get(state, (128, 128, 128))
+        if self._base is not None:
+            img = self._base.copy()
+            d = ImageDraw.Draw(img)
+            s = img.size[0]
+            r = int(s * 0.20)
+            box = (s - 2 * r - 3, s - 2 * r - 3, s - 3, s - 3)
+            d.ellipse((box[0] - 3, box[1] - 3, box[2] + 3, box[3] + 3),
+                      fill=(20, 22, 28, 255))
+            d.ellipse(box, fill=color + (255,))
+            return img
         img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-        d = ImageDraw.Draw(img)
-        d.ellipse((8, 8, 56, 56), fill=self.COLORS[state] + (255,))
+        ImageDraw.Draw(img).ellipse((8, 8, 56, 56), fill=color + (255,))
         return img
 
     def set_state(self, state: str, title: str):
@@ -610,6 +693,7 @@ class SettingsWindow:
         try:
             root = tk.Tk()
             root.title(f"{APP_NAME} — Налаштування")
+            set_window_icon(root)
             root.resizable(False, False)
             root.attributes("-topmost", True)
             pad = {"padx": 10, "pady": 6}
@@ -737,6 +821,12 @@ class SettingsWindow:
                 column=0, row=row, columnspan=3, sticky="w", **pad)
             row += 1
 
+            autostart_var = tk.BooleanVar(value=is_autostart_enabled())
+            ttk.Checkbutton(root, text="Запускати разом з Windows",
+                            variable=autostart_var).grid(
+                column=0, row=row, columnspan=3, sticky="w", **pad)
+            row += 1
+
             def do_save():
                 hk = hotkey_var.get().strip()
                 if not validate_hotkey(hk):
@@ -761,6 +851,7 @@ class SettingsWindow:
                     "preview": bool(preview_var.get()),
                 })
                 try:
+                    set_autostart(bool(autostart_var.get()))
                     self.on_save(new)
                 except Exception as e:
                     log.exception("Apply settings failed: %s", e)
@@ -816,6 +907,7 @@ class App:
             try:
                 root = tk.Tk()
                 root.title(f"{APP_NAME} — Історія")
+                set_window_icon(root)
                 root.attributes("-topmost", True)
                 if not items:
                     ttk.Label(root, text="Поки порожньо").pack(padx=20, pady=20)
@@ -944,6 +1036,7 @@ class App:
             try:
                 root = tk.Tk()
                 root.title(f"{APP_NAME} — прев'ю")
+                set_window_icon(root)
                 root.attributes("-topmost", True)
                 box = tk.Text(root, width=60, height=6, wrap="word")
                 box.insert("1.0", text)
