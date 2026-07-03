@@ -9,6 +9,7 @@ venv/
 build/
 dist/
 *.spec
+!mac/flowdictate_mac.spec   # intentional macOS build spec (used by CI)
 
 # Release archives (huge; ship as GitHub Release assets, not in git)
 release/
