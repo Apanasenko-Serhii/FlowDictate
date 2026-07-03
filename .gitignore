@@ -8,8 +8,9 @@ venv/
 # PyInstaller / build output
 build/
 dist/
+# intentional macOS build spec (used by CI) — keep it despite *.spec below
 *.spec
-!mac/flowdictate_mac.spec   # intentional macOS build spec (used by CI)
+!mac/flowdictate_mac.spec
 
 # Release archives (huge; ship as GitHub Release assets, not in git)
 release/
