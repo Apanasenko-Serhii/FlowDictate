@@ -1,0 +1,9 @@
+{
+  "hotkey": "right alt",
+  "model": "large-v3-turbo",
+  "language": "auto",
+  "beam_size": 2,
+  "min_seconds": 0.3,
+  "sounds": true,
+  "initial_prompt": "Диктування українською. Термінологія: ЛДСП, МДФ, кромка, фурнітура Blum, Базіс-Мебельщик, корпус, фасад, тумба, шафа, стільниця, антресоль."
+}

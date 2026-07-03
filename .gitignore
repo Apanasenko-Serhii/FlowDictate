@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller / build output
+build/
+dist/
+*.spec
+
+# Release archives (huge; ship as GitHub Release assets, not in git)
+release/
+
+# Runtime artifacts
+*.log
+config.json
+test_speech.wav
+
+# macOS build output
+mac/build/
+mac/dist/
+mac/.venv/
+
+# OS
+.DS_Store
+Thumbs.db
