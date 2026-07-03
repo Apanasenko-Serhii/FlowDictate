@@ -8,6 +8,7 @@ Fully offline, no word limits.
 import json
 import logging
 import queue
+import re
 import sys
 import threading
 import time
@@ -18,11 +19,12 @@ SAMPLE_RATE = 16000
 
 DEFAULT_CONFIG = {
     "hotkey": "right ctrl",
+    "hotkey_mode": "hold",       # hold = record while held; toggle = tap on/off
     "suppress_hotkey": True,
     "model": "large-v3-turbo",
     "device": "auto",            # auto -> try cuda, fall back to cpu
     "language": "auto",          # auto | uk | en | ...
-    "beam_size": 2,
+    "beam_size": 5,              # higher = more accurate (v2 tuning)
     "min_seconds": 0.3,
     "sounds": True,              # master switch for all sounds
     "beep_on_record": False,     # short beep when recording STARTS (off by default)
@@ -30,6 +32,16 @@ DEFAULT_CONFIG = {
         "Диктування українською. Термінологія: ЛДСП, МДФ, кромка, фурнітура "
         "Blum, Базіс-Мебельщик, корпус, фасад, тумба, шафа, стільниця, антресоль."
     ),
+    # --- v2 ---
+    "vocabulary": [],            # user terms/names -> biases recognition
+    "voice_punctuation": True,   # "кома"/"крапка"/"з нового рядка" -> symbols
+    "cleanup": False,            # AI cleanup via local LLM (off until model ready)
+    "cleanup_endpoint": "http://localhost:11434/v1",   # Ollama (OpenAI-compatible)
+    "cleanup_model": "qwen2.5:7b",   # quality default; "qwen2.5:3b" = faster/lighter
+    "cleanup_style": "light",    # light | full
+    "cleanup_timeout": 20,
+    "preview": False,            # show a preview/edit window before pasting
+    "history_size": 50,          # keep last N dictations
 }
 
 
@@ -185,6 +197,11 @@ class Paster:
 
         threading.Thread(target=restore, daemon=True).start()
 
+    def undo(self):
+        """Undo the last insertion in the active app (Ctrl+Z)."""
+        import keyboard
+        keyboard.send("ctrl+z")
+
     @staticmethod
     def _get_clipboard():
         import win32clipboard as wc
@@ -221,13 +238,21 @@ class HotkeyListener:
     Combo semantics: recording starts when ALL keys are held, stops when ANY
     of them is released. `suppress` applies to single-key hotkeys only —
     swallowing a modifier globally would break normal typing.
+
+    Modes:
+      hold   - record while the key/combo is held (default).
+      toggle - tap once to start, tap again to stop (comfortable for long
+               dictations: no need to keep a key pressed).
     """
 
-    def __init__(self, hotkey: str, on_start, on_stop, suppress: bool):
+    def __init__(self, hotkey: str, on_start, on_stop, suppress: bool,
+                 mode: str = "hold", on_toggle=None):
         import keyboard
         self._kb = keyboard
         self.on_start, self.on_stop = on_start, on_stop
-        self._active = False
+        self.on_toggle = on_toggle or (lambda: None)
+        self.mode = mode
+        self._engaged = False   # key/combo physically held right now
         self.parts = [p.strip() for p in hotkey.split("+") if p.strip()]
         if not self.parts:
             raise ValueError(f"Empty hotkey: {hotkey!r}")
@@ -238,27 +263,200 @@ class HotkeyListener:
         else:
             keyboard.hook(self._event)
 
-    def _press(self, _event):
-        if not self._active:
-            self._active = True
+    def _engage(self):
+        if self._engaged:
+            return
+        self._engaged = True
+        if self.mode == "toggle":
+            self.on_toggle()      # flip recording on each tap
+        else:
             self.on_start()
 
+    def _disengage(self):
+        if not self._engaged:
+            return
+        self._engaged = False
+        if self.mode != "toggle":
+            self.on_stop()        # hold mode: release stops recording
+
+    def _press(self, _event):
+        self._engage()
+
     def _release(self, _event):
-        if self._active:
-            self._active = False
-            self.on_stop()
+        self._disengage()
 
     def _event(self, event):
         if event.event_type == "down":
-            if not self._active and all(
+            if not self._engaged and all(
                     self._kb.is_pressed(p) for p in self.parts):
-                self._press(event)
-        elif event.event_type == "up" and self._active:
+                self._engage()
+        elif event.event_type == "up" and self._engaged:
             if any(not self._kb.is_pressed(p) for p in self.parts):
-                self._release(event)
+                self._disengage()
 
     def unhook(self):
         self._kb.unhook_all()
+
+
+# --- text processing (v2) --------------------------------------------------
+
+# Order matters: multi-word phrases before single words.
+_VOICE_PUNCT = [
+    (r"\bновий абзац\b", "\n\n"),
+    (r"\bз нового абзацу\b", "\n\n"),
+    (r"\bз нового рядка\b", "\n"),
+    (r"\bновий рядок\b", "\n"),
+    (r"\bкрапка з комою\b", ";"),
+    (r"\bзнак питання\b", "?"),
+    (r"\bзнак запитання\b", "?"),
+    (r"\bзнак оклику\b", "!"),
+    (r"\bтри крапки\b", "…"),
+    (r"\bдвокрапка\b", ":"),
+    (r"\bтире\b", " — "),
+    (r"\bкома\b", ","),
+    (r"\bкрапка\b", "."),
+]
+
+_DELETE_CMDS = {"видали останнє", "видалити останнє", "стерти останнє",
+                "видали", "скасувати"}
+
+
+def detect_command(text: str):
+    """Return a command name if the whole utterance is a command, else None."""
+    t = re.sub(r"[.\s]+$", "", (text or "").strip().lower())
+    if t in _DELETE_CMDS:
+        return "undo"
+    return None
+
+
+def apply_voice_punctuation(text: str) -> str:
+    """Turn spoken 'кома'/'крапка'/'з нового рядка' into real symbols."""
+    if not text:
+        return text
+    out = text
+    for pat, rep in _VOICE_PUNCT:
+        out = re.sub(pat, rep, out, flags=re.IGNORECASE)
+    out = re.sub(r"[ \t]+([,.:;!?…])", r"\1", out)      # no space before
+    out = re.sub(r"([,.:;!?…])(?=[^\s\d])", r"\1 ", out)  # space after if glued
+    out = re.sub(r"[ \t]*\n[ \t]*", "\n", out)          # tidy around newlines
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    return out.strip()
+
+
+def build_initial_prompt(cfg: dict):
+    """Base prompt plus the user's vocabulary, to bias recognition."""
+    base = (cfg.get("initial_prompt") or "").strip()
+    vocab = [v.strip() for v in (cfg.get("vocabulary") or []) if v.strip()]
+    if vocab:
+        base = (base + " Власні назви: " + ", ".join(vocab) + ".").strip()
+    return base or None
+
+
+_CLEANUP_LIGHT = (
+    "Ти коректор тексту, продиктованого голосом. Зроби РІВНО дві речі: "
+    "(1) прибери слова-паразити (еее, ммм, ну, як би, типу, коротше); "
+    "(2) розстав пунктуацію та великі літери. "
+    "СУВОРО ЗАБОРОНЕНО: перекладати текст, змінювати мову, додавати чи "
+    "видаляти слова, міняти їх порядок або зміст, вживати ієрогліфи чи "
+    "символи інших мов. Збережи кожне авторське слово тією ж мовою. "
+    "Поверни ЛИШЕ виправлений текст, без пояснень і без лапок.\n"
+    "Приклад вхід: ну значить треба купити матеріал і порізати його\n"
+    "Приклад вихід: Значить, треба купити матеріал і порізати його."
+)
+_CLEANUP_FULL = (
+    "Ти редактор. Причеши продиктований текст: пунктуація, великі літери, "
+    "граматика, поділ на речення й абзаци, за потреби оформи списки. Збережи "
+    "зміст і мову оригіналу. Поверни ЛИШЕ готовий текст, без пояснень."
+)
+
+
+class Cleaner:
+    """Optional AI cleanup via a local OpenAI-compatible endpoint (Ollama /
+    LM Studio). Any failure falls back to the raw text — never blocks."""
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+
+    def cleanup(self, text: str) -> str:
+        if not text or not self.cfg.get("cleanup"):
+            return text
+        import urllib.request
+        style = self.cfg.get("cleanup_style", "light")
+        system = _CLEANUP_FULL if style == "full" else _CLEANUP_LIGHT
+        vocab = [v.strip() for v in (self.cfg.get("vocabulary") or [])
+                 if v.strip()]
+        if vocab:
+            system += (" Не змінюй написання власних назв: "
+                       + ", ".join(vocab) + ".")
+        body = json.dumps({
+            "model": self.cfg.get("cleanup_model", "qwen2.5:3b"),
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": text},
+            ],
+            "temperature": 0 if style == "light" else 0.3,
+            "stream": False,
+        }).encode("utf-8")
+        url = self.cfg.get("cleanup_endpoint",
+                           "http://localhost:11434/v1").rstrip("/")
+        req = urllib.request.Request(
+            url + "/chat/completions", data=body,
+            headers={"Content-Type": "application/json"})
+        try:
+            timeout = float(self.cfg.get("cleanup_timeout", 20))
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            out = data["choices"][0]["message"]["content"].strip()
+            out = self._unwrap(out)
+            log.info("Cleanup ok (%s): %r -> %r", style, text, out)
+            return out or text
+        except Exception as e:
+            log.error("Cleanup failed, using raw text: %s", e)
+            return text
+
+    @staticmethod
+    def _unwrap(s: str) -> str:
+        s = s.strip()
+        # strip a single pair of wrapping quotes/backticks the model may add
+        for q in ('"', "'", "`", "«"):
+            if s.startswith(q):
+                s = s[1:]
+                break
+        for q in ('"', "'", "`", "»"):
+            if s.endswith(q):
+                s = s[:-1]
+                break
+        return s.strip()
+
+
+class History:
+    """Keeps the last N dictations, persisted next to the app data."""
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.path = data_dir() / "history.json"
+        self.items = []
+        try:
+            if self.path.exists():
+                self.items = json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception:
+            self.items = []
+
+    def add(self, text: str) -> None:
+        if not text:
+            return
+        self.items.insert(0, text)
+        n = int(self.cfg.get("history_size", 50))
+        self.items = self.items[:n]
+        try:
+            self.path.write_text(
+                json.dumps(self.items, ensure_ascii=False, indent=2),
+                encoding="utf-8")
+        except Exception as e:
+            log.error("History save failed: %s", e)
+
+    def recent(self, k: int = 10):
+        return self.items[:k]
 
 
 class Engine:
@@ -318,8 +516,9 @@ class Engine:
             language=None if lang == "auto" else lang,
             beam_size=int(self.cfg["beam_size"]),
             vad_filter=True,
-            initial_prompt=self.cfg["initial_prompt"] or None,
+            initial_prompt=build_initial_prompt(self.cfg),
             condition_on_previous_text=False,
+            temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
         )
         text = " ".join(s.text.strip() for s in segments).strip()
         log.info("Transcribed (%s, %.1fs audio): %r",
@@ -336,15 +535,16 @@ class TrayIcon:
         "error": (0, 0, 0),
     }
 
-    def __init__(self, on_quit, on_settings):
+    def __init__(self, on_quit, on_settings, on_history=None):
         import pystray
         self._pystray = pystray
+        items = [pystray.MenuItem("Налаштування…", lambda: on_settings())]
+        if on_history is not None:
+            items.append(pystray.MenuItem("Історія…", lambda: on_history()))
+        items.append(pystray.MenuItem("Вихід", lambda: on_quit()))
         self.icon = pystray.Icon(
             APP_NAME, self._image("loading"), f"{APP_NAME} — завантаження…",
-            menu=pystray.Menu(
-                pystray.MenuItem("Налаштування…", lambda: on_settings()),
-                pystray.MenuItem("Вихід", lambda: on_quit()),
-            ),
+            menu=pystray.Menu(*items),
         )
 
     def _image(self, state: str):
@@ -445,6 +645,19 @@ class SettingsWindow:
                 column=1, row=row, columnspan=2, sticky="w", padx=10)
             row += 1
 
+            ttk.Label(root, text="Режим клавіші").grid(
+                column=0, row=row, sticky="w", **pad)
+            mode_map = {"тримати (hold)": "hold", "перемикач (toggle)": "toggle"}
+            mode_rev = {v: k for k, v in mode_map.items()}
+            mode_var = tk.StringVar(
+                value=mode_rev.get(self.cfg.get("hotkey_mode", "hold"),
+                                   "тримати (hold)"))
+            ttk.Combobox(root, textvariable=mode_var,
+                         values=list(mode_map.keys()), width=20,
+                         state="readonly").grid(
+                column=1, row=row, columnspan=2, sticky="we", **pad)
+            row += 1
+
             ttk.Label(root, text="Мова").grid(
                 column=0, row=row, sticky="w", **pad)
             lang_var = tk.StringVar(value=self.cfg.get("language", "auto"))
@@ -475,6 +688,55 @@ class SettingsWindow:
                 column=0, row=row, columnspan=3, sticky="w", **pad)
             row += 1
 
+            # --- dictionary ---
+            ttk.Label(root, text="Словник — імена/терміни, по одному на рядок")\
+                .grid(column=0, row=row, columnspan=3, sticky="w", **pad)
+            row += 1
+            vocab_box = tk.Text(root, width=44, height=5, wrap="word")
+            vocab_box.insert("1.0", "\n".join(self.cfg.get("vocabulary") or []))
+            vocab_box.grid(column=0, row=row, columnspan=3, sticky="we",
+                           padx=10)
+            row += 1
+
+            # --- AI cleanup ---
+            cleanup_var = tk.BooleanVar(
+                value=bool(self.cfg.get("cleanup", False)))
+            ttk.Checkbutton(root, text="AI-чистка тексту (Ollama)",
+                            variable=cleanup_var).grid(
+                column=0, row=row, columnspan=3, sticky="w", **pad)
+            row += 1
+            ttk.Label(root, text="Модель чистки").grid(
+                column=0, row=row, sticky="w", **pad)
+            cmodel_var = tk.StringVar(
+                value=self.cfg.get("cleanup_model", "qwen2.5:7b"))
+            ttk.Combobox(root, textvariable=cmodel_var,
+                         values=["qwen2.5:7b", "qwen2.5:3b"], width=20,
+                         state="readonly").grid(
+                column=1, row=row, columnspan=2, sticky="we", **pad)
+            row += 1
+            ttk.Label(root, text="Стиль чистки").grid(
+                column=0, row=row, sticky="w", **pad)
+            cstyle_var = tk.StringVar(
+                value=self.cfg.get("cleanup_style", "light"))
+            ttk.Combobox(root, textvariable=cstyle_var,
+                         values=["light", "full"], width=20,
+                         state="readonly").grid(
+                column=1, row=row, columnspan=2, sticky="we", **pad)
+            row += 1
+
+            vpunct_var = tk.BooleanVar(
+                value=bool(self.cfg.get("voice_punctuation", True)))
+            ttk.Checkbutton(root, text="Голосова пунктуація (кома, крапка…)",
+                            variable=vpunct_var).grid(
+                column=0, row=row, columnspan=3, sticky="w", **pad)
+            row += 1
+            preview_var = tk.BooleanVar(
+                value=bool(self.cfg.get("preview", False)))
+            ttk.Checkbutton(root, text="Прев'ю перед вставкою",
+                            variable=preview_var).grid(
+                column=0, row=row, columnspan=3, sticky="w", **pad)
+            row += 1
+
             def do_save():
                 hk = hotkey_var.get().strip()
                 if not validate_hotkey(hk):
@@ -484,10 +746,19 @@ class SettingsWindow:
                 new = dict(self.cfg)
                 new.update({
                     "hotkey": hk,
+                    "hotkey_mode": mode_map.get(mode_var.get(), "hold"),
                     "language": lang_var.get(),
                     "model": model_var.get(),
                     "sounds": bool(sounds_var.get()),
                     "beep_on_record": bool(beep_var.get()),
+                    "vocabulary": [v.strip() for v in
+                                   vocab_box.get("1.0", "end").splitlines()
+                                   if v.strip()],
+                    "cleanup": bool(cleanup_var.get()),
+                    "cleanup_model": cmodel_var.get(),
+                    "cleanup_style": cstyle_var.get(),
+                    "voice_punctuation": bool(vpunct_var.get()),
+                    "preview": bool(preview_var.get()),
                 })
                 try:
                     self.on_save(new)
@@ -519,10 +790,13 @@ class App:
         self.beeper = Beeper(bool(self.cfg["sounds"]),
                              bool(self.cfg.get("beep_on_record", False)))
         self.engine = Engine(self.cfg)
+        self.cleaner = Cleaner(self.cfg)
+        self.history = History(self.cfg)
         self.recorder = None
         self.paster = Paster()
         self.jobs = queue.Queue()
-        self.tray = TrayIcon(on_quit=self.quit, on_settings=self.open_settings)
+        self.tray = TrayIcon(on_quit=self.quit, on_settings=self.open_settings,
+                             on_history=self.open_history)
         self.settings = SettingsWindow(self.cfg, self.apply_settings)
         self.listener = None
         self._armed = False
@@ -532,6 +806,34 @@ class App:
     def open_settings(self):
         self.settings.cfg = self.cfg
         self.settings.open()
+
+    def open_history(self):
+        items = self.history.recent(20)
+
+        def run():
+            import tkinter as tk
+            from tkinter import ttk
+            try:
+                root = tk.Tk()
+                root.title(f"{APP_NAME} — Історія")
+                root.attributes("-topmost", True)
+                if not items:
+                    ttk.Label(root, text="Поки порожньо").pack(padx=20, pady=20)
+                for it in items:
+                    frm = ttk.Frame(root)
+                    frm.pack(fill="x", padx=8, pady=2)
+                    preview = (it[:70] + "…") if len(it) > 70 else it
+                    ttk.Label(frm, text=preview.replace("\n", " "),
+                              width=60, anchor="w").pack(side="left")
+                    ttk.Button(
+                        frm, text="Копіювати",
+                        command=lambda t=it: Paster._set_clipboard(t)).pack(
+                        side="right")
+                root.mainloop()
+            except Exception as e:
+                log.exception("History window error: %s", e)
+
+        threading.Thread(target=run, daemon=True).start()
 
     def apply_settings(self, new_cfg: dict):
         old_hotkey = self.cfg.get("hotkey")
@@ -558,9 +860,18 @@ class App:
                 pass
         self.listener = HotkeyListener(
             self.cfg["hotkey"], self._on_start, self._on_stop,
-            suppress=bool(self.cfg["suppress_hotkey"]))
+            suppress=bool(self.cfg["suppress_hotkey"]),
+            mode=self.cfg.get("hotkey_mode", "hold"),
+            on_toggle=self._on_toggle)
 
     # --- hotkey handlers ---------------------------------------------------
+    def _on_toggle(self):
+        # toggle mode: tap starts recording, tap again stops it
+        if self._armed:
+            self._on_stop()
+        else:
+            self._on_start()
+
     def _on_start(self):
         if self.engine.model is None or self.recorder is None:
             return
@@ -588,10 +899,7 @@ class App:
                     log.info("Clip too short (%.2fs), ignored",
                              len(audio) / SAMPLE_RATE)
                 else:
-                    text = self.engine.transcribe(audio)
-                    if text:
-                        self.paster.paste(text)
-                        self.beeper.done()
+                    self._process(self.engine.transcribe(audio))
             except Exception as e:
                 log.exception("Job failed: %s", e)
                 self.beeper.error()
@@ -599,6 +907,75 @@ class App:
                 if not self._quitting:
                     self.tray.set_state(
                         "ready", f"готовий ({self.engine.device})")
+
+    def _process(self, text: str):
+        """Post-whisper pipeline: command -> punctuation -> cleanup ->
+        (preview) -> paste + history."""
+        if not text:
+            return
+        # spoken command (e.g. "видали останнє") short-circuits to an action
+        if detect_command(text) == "undo":
+            self.paster.undo()
+            self.beeper.done()
+            return
+        if self.cfg.get("voice_punctuation", True):
+            text = apply_voice_punctuation(text)
+        if self.cfg.get("cleanup"):
+            self.tray.set_state("busy", "чищу текст…")
+            text = self.cleaner.cleanup(text)
+        if not text:
+            return
+        if self.cfg.get("preview"):
+            text = self._preview(text)
+            if text is None:      # user cancelled
+                return
+        self.paster.paste(text)
+        self.history.add(text)
+        self.beeper.done()
+
+    def _preview(self, text: str):
+        """Blocking preview/edit dialog; returns edited text or None."""
+        result = {"text": None}
+        done = threading.Event()
+
+        def run():
+            import tkinter as tk
+            from tkinter import ttk
+            try:
+                root = tk.Tk()
+                root.title(f"{APP_NAME} — прев'ю")
+                root.attributes("-topmost", True)
+                box = tk.Text(root, width=60, height=6, wrap="word")
+                box.insert("1.0", text)
+                box.pack(padx=10, pady=10)
+                box.focus_force()
+
+                def insert():
+                    result["text"] = box.get("1.0", "end").rstrip("\n")
+                    root.destroy()
+
+                def cancel():
+                    result["text"] = None
+                    root.destroy()
+
+                bar = ttk.Frame(root)
+                bar.pack(pady=(0, 10))
+                ttk.Button(bar, text="Вставити (Ctrl+Enter)",
+                           command=insert).pack(side="left", padx=6)
+                ttk.Button(bar, text="Скасувати (Esc)",
+                           command=cancel).pack(side="left", padx=6)
+                root.bind("<Control-Return>", lambda e: insert())
+                root.bind("<Escape>", lambda e: cancel())
+                root.protocol("WM_DELETE_WINDOW", cancel)
+                root.mainloop()
+            except Exception as e:
+                log.exception("Preview error: %s", e)
+            finally:
+                done.set()
+
+        threading.Thread(target=run, daemon=True).start()
+        done.wait()
+        return result["text"]
 
     # --- startup / shutdown -------------------------------------------------
     def _startup(self):
