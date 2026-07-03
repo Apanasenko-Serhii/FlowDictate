@@ -80,6 +80,14 @@ Logic that can be tested without a mic/GPU is covered:
 active window (clipboard + Ctrl/Cmd+V)`. The model runs locally; the app only
 holds audio in memory while you speak.
 
+## 💛 Support the project
+
+Everyone who wants to help with development — here's a Monobank jar:
+**https://send.monobank.ua/jar/5EsHj8Tyng**
+
+Усі, хто хоче допомогти в розвитку — банка Monobank:
+**https://send.monobank.ua/jar/5EsHj8Tyng**
+
 ## Credits & license
 
 - [OpenAI Whisper](https://github.com/openai/whisper) — MIT
