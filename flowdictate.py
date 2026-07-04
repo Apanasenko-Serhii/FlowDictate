@@ -516,6 +516,7 @@ class Engine:
             language=None if lang == "auto" else lang,
             beam_size=int(self.cfg["beam_size"]),
             vad_filter=True,
+            vad_parameters=dict(speech_pad_ms=400),
             initial_prompt=build_initial_prompt(self.cfg),
             condition_on_previous_text=False,
             temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
@@ -588,6 +589,72 @@ def set_autostart(enable: bool) -> None:
             log.info("Autostart disabled")
     except Exception as e:
         log.error("Autostart change failed: %s", e)
+
+
+class Overlay:
+    """A small floating 'recording' pill near the bottom of the screen,
+    shown while dictating (like Wispr). Runs its own Tk root in a thread."""
+
+    def __init__(self):
+        self._cmd = queue.Queue()
+        self._root = None
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        try:
+            import tkinter as tk
+            root = tk.Tk()
+            root.overrideredirect(True)
+            root.attributes("-topmost", True)
+            try:
+                root.attributes("-alpha", 0.96)
+            except Exception:
+                pass
+            BG = "#20242C"
+            root.configure(bg=BG)
+            frame = tk.Frame(root, bg=BG)
+            frame.pack()
+            self._dot = tk.Canvas(frame, width=14, height=14, bg=BG,
+                                  highlightthickness=0)
+            self._dot.pack(side="left", padx=(16, 8), pady=11)
+            self._dot_id = self._dot.create_oval(2, 2, 12, 12,
+                                                 fill="#E03B3B", outline="")
+            self._lbl = tk.Label(frame, text="Запис", fg="#FFFFFF", bg=BG,
+                                 font=("Segoe UI", 12))
+            self._lbl.pack(side="left", padx=(0, 18), pady=11)
+            root.withdraw()
+            self._root = root
+            self._pump()
+            root.mainloop()
+        except Exception as e:
+            log.error("Overlay error: %s", e)
+
+    def _pump(self):
+        try:
+            while True:
+                cmd = self._cmd.get_nowait()
+                if cmd[0] == "show":
+                    self._lbl.config(text=cmd[1])
+                    self._dot.itemconfig(self._dot_id, fill=cmd[2])
+                    self._root.deiconify()
+                    self._root.update_idletasks()
+                    w = self._root.winfo_width()
+                    sw = self._root.winfo_screenwidth()
+                    sh = self._root.winfo_screenheight()
+                    self._root.geometry(f"+{(sw - w) // 2}+{sh - 140}")
+                    self._root.lift()
+                elif cmd[0] == "hide":
+                    self._root.withdraw()
+        except queue.Empty:
+            pass
+        if self._root is not None:
+            self._root.after(60, self._pump)
+
+    def show(self, text: str, color: str):
+        self._cmd.put(("show", text, color))
+
+    def hide(self):
+        self._cmd.put(("hide",))
 
 
 class TrayIcon:
@@ -758,27 +825,39 @@ class SettingsWindow:
                                         hover_color="#3d434f")
             capture_btn.pack(side="right", padx=8)
 
-            def do_capture():
+            capturing = {"on": False}
+
+            def do_capture(*_):
+                if capturing["on"]:
+                    return
+                capturing["on"] = True
                 capture_btn.configure(text="Натисніть…", state="disabled")
 
                 def worker():
+                    combo = None
                     try:
                         import keyboard
                         combo = keyboard.read_hotkey(suppress=False)
-                        hotkey_entry.delete(0, "end")
-                        hotkey_entry.insert(0, combo)
                     except Exception as e:
                         log.error("Hotkey capture failed: %s", e)
-                    finally:
-                        try:
-                            capture_btn.configure(text="Записати",
-                                                  state="normal")
-                        except Exception:
-                            pass
+
+                    def apply():
+                        if combo:
+                            hotkey_entry.delete(0, "end")
+                            hotkey_entry.insert(0, combo)
+                        capture_btn.configure(text="Записати", state="normal")
+                        capturing["on"] = False
+
+                    try:
+                        hotkey_entry.after(0, apply)
+                    except Exception:
+                        capturing["on"] = False
 
                 threading.Thread(target=worker, daemon=True).start()
 
             capture_btn.configure(command=do_capture)
+            # click the field itself to record a key/combo
+            hotkey_entry.bind("<Button-1>", do_capture)
             r = row(c, "Режим")
             mode_menu = menu(r, ["тримати", "перемикач"])
             mode_menu.set("тримати" if cfg.get("hotkey_mode", "hold") == "hold"
@@ -864,8 +943,16 @@ class SettingsWindow:
                     return
                 root.destroy()
 
+            def open_jar():
+                import webbrowser
+                webbrowser.open("https://send.monobank.ua/jar/5EsHj8Tyng")
+
             foot = ctk.CTkFrame(root, fg_color="transparent")
             foot.pack(fill="x", padx=20, pady=14)
+            ctk.CTkButton(foot, text="💛 Підтримати проєкт",
+                          fg_color="transparent", hover_color="#2B2F38",
+                          text_color=GOLD, width=150, height=38,
+                          command=open_jar).pack(side="left")
             ctk.CTkButton(foot, text="Зберегти", fg_color=GOLD,
                           text_color="#1A1A1A", hover_color="#d9a92a",
                           font=F(size=14, weight="bold"), height=38,
@@ -890,6 +977,7 @@ class App:
         self.engine = Engine(self.cfg)
         self.cleaner = Cleaner(self.cfg)
         self.history = History(self.cfg)
+        self.overlay = Overlay()
         self.recorder = None
         self.paster = Paster()
         self.jobs = queue.Queue()
@@ -978,6 +1066,7 @@ class App:
         self.recorder.start()
         self.beeper.start()
         self.tray.set_state("recording", "запис…")
+        self.overlay.show("Запис", "#E03B3B")
 
     def _on_stop(self):
         if not self._armed:
@@ -985,6 +1074,7 @@ class App:
         self._armed = False
         audio = self.recorder.stop()
         self.tray.set_state("busy", "розпізнаю…")
+        self.overlay.show("Розпізнаю…", "#EDBB30")
         self.jobs.put(audio)
 
     # --- worker ------------------------------------------------------------
@@ -1003,6 +1093,7 @@ class App:
                 log.exception("Job failed: %s", e)
                 self.beeper.error()
             finally:
+                self.overlay.hide()
                 if not self._quitting:
                     self.tray.set_state(
                         "ready", f"готовий ({self.engine.device})")
