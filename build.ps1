@@ -14,6 +14,7 @@ Set-Location $root
     --add-data "$root\assets;assets" `
     --collect-all faster_whisper `
     --collect-all sounddevice `
+    --collect-all customtkinter `
     "$root\flowdictate.py"
 
 $internal = Join-Path $root "dist\FlowDictate\_internal"

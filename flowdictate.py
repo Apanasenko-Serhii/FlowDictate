@@ -688,147 +688,151 @@ class SettingsWindow:
         threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self):
-        import tkinter as tk
-        from tkinter import ttk, messagebox
+        import customtkinter as ctk
+        from tkinter import messagebox
+        from PIL import Image
+        cfg = self.cfg
+        GOLD, CARD, SUB, BG = "#EDBB30", "#23262E", "#9AA0AA", "#171A20"
         try:
-            root = tk.Tk()
+            ctk.set_appearance_mode("dark")
+            root = ctk.CTk()
             root.title(f"{APP_NAME} — Налаштування")
+            root.geometry("480x780")
+            root.configure(fg_color=BG)
             set_window_icon(root)
-            root.resizable(False, False)
-            root.attributes("-topmost", True)
-            pad = {"padx": 10, "pady": 6}
-            row = 0
+            F = ctk.CTkFont
 
-            ttk.Label(root, text="Гаряча клавіша").grid(
-                column=0, row=row, sticky="w", **pad)
-            hotkey_var = tk.StringVar(value=self.cfg.get("hotkey", "right ctrl"))
-            entry = ttk.Entry(root, textvariable=hotkey_var, width=22)
-            entry.grid(column=1, row=row, sticky="we", **pad)
-            capture_btn = ttk.Button(root, text="Записати")
-            capture_btn.grid(column=2, row=row, **pad)
+            header = ctk.CTkFrame(root, fg_color="transparent")
+            header.pack(fill="x", padx=22, pady=(20, 6))
+            lp = find_logo()
+            if lp:
+                try:
+                    root._logo = ctk.CTkImage(Image.open(lp), size=(46, 46))
+                    ctk.CTkLabel(header, image=root._logo, text="").pack(
+                        side="left")
+                except Exception:
+                    pass
+            tf = ctk.CTkFrame(header, fg_color="transparent")
+            tf.pack(side="left", padx=14)
+            ctk.CTkLabel(tf, text="FlowDictate",
+                         font=F(size=20, weight="bold")).pack(anchor="w")
+            ctk.CTkLabel(tf, text="Налаштування", text_color=SUB,
+                         font=F(size=13)).pack(anchor="w")
+
+            body = ctk.CTkScrollableFrame(root, fg_color="transparent")
+            body.pack(fill="both", expand=True, padx=16, pady=(6, 4))
+
+            def section(title):
+                ctk.CTkLabel(body, text=title.upper(), text_color=GOLD,
+                             font=F(size=11, weight="bold")).pack(
+                    anchor="w", pady=(16, 6), padx=6)
+                card = ctk.CTkFrame(body, fg_color=CARD, corner_radius=14)
+                card.pack(fill="x")
+                return card
+
+            def row(card, label):
+                r = ctk.CTkFrame(card, fg_color="transparent")
+                r.pack(fill="x", padx=14, pady=9)
+                ctk.CTkLabel(r, text=label, font=F(size=13)).pack(side="left")
+                return r
+
+            def menu(parent, values):
+                return ctk.CTkOptionMenu(
+                    parent, values=values, width=150, fg_color="#2B2F38",
+                    button_color=GOLD, button_hover_color="#d9a92a")
+
+            def switch(parent, on):
+                sw = ctk.CTkSwitch(parent, text="", progress_color=GOLD)
+                (sw.select if on else sw.deselect)()
+                sw.pack(side="right")
+                return sw
+
+            # Hotkey
+            c = section("Гаряча клавіша")
+            r = row(c, "Клавіша")
+            hotkey_entry = ctk.CTkEntry(r, width=150)
+            hotkey_entry.insert(0, cfg.get("hotkey", "right ctrl"))
+            hotkey_entry.pack(side="right")
+            capture_btn = ctk.CTkButton(r, text="Записати", width=96,
+                                        fg_color="#333842",
+                                        hover_color="#3d434f")
+            capture_btn.pack(side="right", padx=8)
 
             def do_capture():
-                capture_btn.config(text="Натисніть…", state="disabled")
+                capture_btn.configure(text="Натисніть…", state="disabled")
 
                 def worker():
                     try:
                         import keyboard
                         combo = keyboard.read_hotkey(suppress=False)
-                        hotkey_var.set(combo)
+                        hotkey_entry.delete(0, "end")
+                        hotkey_entry.insert(0, combo)
                     except Exception as e:
                         log.error("Hotkey capture failed: %s", e)
                     finally:
-                        capture_btn.config(text="Записати", state="normal")
+                        try:
+                            capture_btn.configure(text="Записати",
+                                                  state="normal")
+                        except Exception:
+                            pass
 
                 threading.Thread(target=worker, daemon=True).start()
 
-            capture_btn.config(command=do_capture)
-            row += 1
+            capture_btn.configure(command=do_capture)
+            r = row(c, "Режим")
+            mode_menu = menu(r, ["тримати", "перемикач"])
+            mode_menu.set("тримати" if cfg.get("hotkey_mode", "hold") == "hold"
+                          else "перемикач")
+            mode_menu.pack(side="right")
 
-            ttk.Label(root, text="(напр. right ctrl, ctrl+shift, f9)").grid(
-                column=1, row=row, columnspan=2, sticky="w", padx=10)
-            row += 1
+            # Recognition
+            c = section("Розпізнавання")
+            lang_menu = menu(row(c, "Мова"),
+                             ["auto", "uk", "en", "ru", "pl", "de"])
+            lang_menu.set(cfg.get("language", "auto"))
+            lang_menu.pack(side="right")
+            model_menu = menu(row(c, "Модель"),
+                              ["large-v3-turbo", "large-v3", "medium", "small",
+                               "base"])
+            model_menu.set(cfg.get("model", "large-v3-turbo"))
+            model_menu.pack(side="right")
+            ctk.CTkLabel(c, text="Словник (імена, терміни — по одному на рядок)",
+                         text_color=SUB, font=F(size=12)).pack(
+                anchor="w", padx=14, pady=(4, 2))
+            vocab_box = ctk.CTkTextbox(c, height=80, corner_radius=8)
+            vocab_box.insert("1.0", "\n".join(cfg.get("vocabulary") or []))
+            vocab_box.pack(fill="x", padx=14, pady=(0, 12))
 
-            ttk.Label(root, text="Режим клавіші").grid(
-                column=0, row=row, sticky="w", **pad)
-            mode_map = {"тримати (hold)": "hold", "перемикач (toggle)": "toggle"}
-            mode_rev = {v: k for k, v in mode_map.items()}
-            mode_var = tk.StringVar(
-                value=mode_rev.get(self.cfg.get("hotkey_mode", "hold"),
-                                   "тримати (hold)"))
-            ttk.Combobox(root, textvariable=mode_var,
-                         values=list(mode_map.keys()), width=20,
-                         state="readonly").grid(
-                column=1, row=row, columnspan=2, sticky="we", **pad)
-            row += 1
+            # AI cleanup
+            c = section("AI-чистка тексту")
+            cleanup_sw = switch(row(c, "Увімкнути чистку (Ollama)"),
+                                cfg.get("cleanup"))
+            cmodel_menu = menu(row(c, "Модель чистки"),
+                               ["qwen2.5:7b", "qwen2.5:3b"])
+            cmodel_menu.set(cfg.get("cleanup_model", "qwen2.5:7b"))
+            cmodel_menu.pack(side="right")
+            cstyle_menu = menu(row(c, "Стиль"), ["light", "full"])
+            cstyle_menu.set(cfg.get("cleanup_style", "light"))
+            cstyle_menu.pack(side="right")
 
-            ttk.Label(root, text="Мова").grid(
-                column=0, row=row, sticky="w", **pad)
-            lang_var = tk.StringVar(value=self.cfg.get("language", "auto"))
-            ttk.Combobox(root, textvariable=lang_var, values=self.LANGUAGES,
-                         width=20, state="readonly").grid(
-                column=1, row=row, columnspan=2, sticky="we", **pad)
-            row += 1
+            # Punctuation & insert
+            c = section("Пунктуація та вставка")
+            vp_sw = switch(row(c, "Голосова пунктуація"),
+                           cfg.get("voice_punctuation", True))
+            preview_sw = switch(row(c, "Прев'ю перед вставкою"),
+                                cfg.get("preview"))
 
-            ttk.Label(root, text="Модель (потрібен перезапуск)").grid(
-                column=0, row=row, sticky="w", **pad)
-            model_var = tk.StringVar(
-                value=self.cfg.get("model", "large-v3-turbo"))
-            ttk.Combobox(root, textvariable=model_var, values=self.MODELS,
-                         width=20, state="readonly").grid(
-                column=1, row=row, columnspan=2, sticky="we", **pad)
-            row += 1
-
-            sounds_var = tk.BooleanVar(value=bool(self.cfg.get("sounds", True)))
-            ttk.Checkbutton(root, text="Звук підтвердження вставки",
-                            variable=sounds_var).grid(
-                column=0, row=row, columnspan=3, sticky="w", **pad)
-            row += 1
-
-            beep_var = tk.BooleanVar(
-                value=bool(self.cfg.get("beep_on_record", False)))
-            ttk.Checkbutton(root, text="Звук на початок запису",
-                            variable=beep_var).grid(
-                column=0, row=row, columnspan=3, sticky="w", **pad)
-            row += 1
-
-            # --- dictionary ---
-            ttk.Label(root, text="Словник — імена/терміни, по одному на рядок")\
-                .grid(column=0, row=row, columnspan=3, sticky="w", **pad)
-            row += 1
-            vocab_box = tk.Text(root, width=44, height=5, wrap="word")
-            vocab_box.insert("1.0", "\n".join(self.cfg.get("vocabulary") or []))
-            vocab_box.grid(column=0, row=row, columnspan=3, sticky="we",
-                           padx=10)
-            row += 1
-
-            # --- AI cleanup ---
-            cleanup_var = tk.BooleanVar(
-                value=bool(self.cfg.get("cleanup", False)))
-            ttk.Checkbutton(root, text="AI-чистка тексту (Ollama)",
-                            variable=cleanup_var).grid(
-                column=0, row=row, columnspan=3, sticky="w", **pad)
-            row += 1
-            ttk.Label(root, text="Модель чистки").grid(
-                column=0, row=row, sticky="w", **pad)
-            cmodel_var = tk.StringVar(
-                value=self.cfg.get("cleanup_model", "qwen2.5:7b"))
-            ttk.Combobox(root, textvariable=cmodel_var,
-                         values=["qwen2.5:7b", "qwen2.5:3b"], width=20,
-                         state="readonly").grid(
-                column=1, row=row, columnspan=2, sticky="we", **pad)
-            row += 1
-            ttk.Label(root, text="Стиль чистки").grid(
-                column=0, row=row, sticky="w", **pad)
-            cstyle_var = tk.StringVar(
-                value=self.cfg.get("cleanup_style", "light"))
-            ttk.Combobox(root, textvariable=cstyle_var,
-                         values=["light", "full"], width=20,
-                         state="readonly").grid(
-                column=1, row=row, columnspan=2, sticky="we", **pad)
-            row += 1
-
-            vpunct_var = tk.BooleanVar(
-                value=bool(self.cfg.get("voice_punctuation", True)))
-            ttk.Checkbutton(root, text="Голосова пунктуація (кома, крапка…)",
-                            variable=vpunct_var).grid(
-                column=0, row=row, columnspan=3, sticky="w", **pad)
-            row += 1
-            preview_var = tk.BooleanVar(
-                value=bool(self.cfg.get("preview", False)))
-            ttk.Checkbutton(root, text="Прев'ю перед вставкою",
-                            variable=preview_var).grid(
-                column=0, row=row, columnspan=3, sticky="w", **pad)
-            row += 1
-
-            autostart_var = tk.BooleanVar(value=is_autostart_enabled())
-            ttk.Checkbutton(root, text="Запускати разом з Windows",
-                            variable=autostart_var).grid(
-                column=0, row=row, columnspan=3, sticky="w", **pad)
-            row += 1
+            # Sound & system
+            c = section("Звук та система")
+            sounds_sw = switch(row(c, "Звук підтвердження вставки"),
+                               cfg.get("sounds", True))
+            beep_sw = switch(row(c, "Звук на початок запису"),
+                             cfg.get("beep_on_record"))
+            autostart_sw = switch(row(c, "Запускати разом з Windows"),
+                                  is_autostart_enabled())
 
             def do_save():
-                hk = hotkey_var.get().strip()
+                hk = hotkey_entry.get().strip()
                 if not validate_hotkey(hk):
                     messagebox.showerror(
                         APP_NAME, f"Невідома клавіша або комбінація: {hk!r}")
@@ -836,22 +840,23 @@ class SettingsWindow:
                 new = dict(self.cfg)
                 new.update({
                     "hotkey": hk,
-                    "hotkey_mode": mode_map.get(mode_var.get(), "hold"),
-                    "language": lang_var.get(),
-                    "model": model_var.get(),
-                    "sounds": bool(sounds_var.get()),
-                    "beep_on_record": bool(beep_var.get()),
+                    "hotkey_mode": ("hold" if mode_menu.get() == "тримати"
+                                    else "toggle"),
+                    "language": lang_menu.get(),
+                    "model": model_menu.get(),
                     "vocabulary": [v.strip() for v in
                                    vocab_box.get("1.0", "end").splitlines()
                                    if v.strip()],
-                    "cleanup": bool(cleanup_var.get()),
-                    "cleanup_model": cmodel_var.get(),
-                    "cleanup_style": cstyle_var.get(),
-                    "voice_punctuation": bool(vpunct_var.get()),
-                    "preview": bool(preview_var.get()),
+                    "cleanup": bool(cleanup_sw.get()),
+                    "cleanup_model": cmodel_menu.get(),
+                    "cleanup_style": cstyle_menu.get(),
+                    "voice_punctuation": bool(vp_sw.get()),
+                    "preview": bool(preview_sw.get()),
+                    "sounds": bool(sounds_sw.get()),
+                    "beep_on_record": bool(beep_sw.get()),
                 })
                 try:
-                    set_autostart(bool(autostart_var.get()))
+                    set_autostart(bool(autostart_sw.get()))
                     self.on_save(new)
                 except Exception as e:
                     log.exception("Apply settings failed: %s", e)
@@ -859,14 +864,16 @@ class SettingsWindow:
                     return
                 root.destroy()
 
-            btns = ttk.Frame(root)
-            btns.grid(column=0, row=row, columnspan=3, pady=10)
-            ttk.Button(btns, text="Зберегти", command=do_save).pack(
-                side="left", padx=6)
-            ttk.Button(btns, text="Скасувати", command=root.destroy).pack(
-                side="left", padx=6)
+            foot = ctk.CTkFrame(root, fg_color="transparent")
+            foot.pack(fill="x", padx=20, pady=14)
+            ctk.CTkButton(foot, text="Зберегти", fg_color=GOLD,
+                          text_color="#1A1A1A", hover_color="#d9a92a",
+                          font=F(size=14, weight="bold"), height=38,
+                          command=do_save).pack(side="right")
+            ctk.CTkButton(foot, text="Скасувати", fg_color="#333842",
+                          hover_color="#3d434f", height=38, width=110,
+                          command=root.destroy).pack(side="right", padx=10)
 
-            root.update_idletasks()
             root.protocol("WM_DELETE_WINDOW", root.destroy)
             root.mainloop()
         except Exception as e:
